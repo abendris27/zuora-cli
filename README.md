@@ -1,7 +1,7 @@
 # zuora-cli
 Zuora command line interface
 
-
+go build -o zuo
 /*
 
 		zuo data create

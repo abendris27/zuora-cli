@@ -5,10 +5,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"time"
 
 	"github.com/olekukonko/tablewriter"
@@ -194,6 +199,57 @@ func printJSONFilesAsTable(directory string, columnsToDisplay []string) error {
 	return nil
 }
 
+// Function to login
+func login(urlStr, username, password string) (*http.Response, error) {
+	// Initialize cookie jar to store session cookies
+	jar, err := cookiejar.New(nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create cookie jar: %v", err)
+	}
+
+	// Initialize HTTP client with cookie jar
+	client := &http.Client{
+		Jar: jar,
+	}
+
+	// Create login payload
+	data := url.Values{}
+	data.Set("username", username)
+	data.Set("password", password)
+
+	// Make the POST request to the login page
+	req, err := http.NewRequest("POST", urlStr, strings.NewReader(data.Encode()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+
+	// Set content-type header
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
+
+	// Send the request
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %v", err)
+	}
+
+	// Return the response
+	return resp, nil
+}
+
+// Function to open the URL in the default web browser
+func openBrowser(url string, cookie http.Cookie) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("cmd", "/c", "start", url)
+	case "darwin":
+		cmd = exec.Command("open", url)
+	default:
+		cmd = exec.Command("xdg-open", url)
+	}
+	return cmd.Start()
+}
+
 func main() {
 
 	// ANSI escape code for green text
@@ -268,6 +324,47 @@ func main() {
 	authorizeCmd.MarkFlagRequired("clientSecret")
 	authorizeCmd.MarkFlagRequired("alias")
 
+	var loginCmd = &cobra.Command{
+		Use:   "login",
+		Short: "login to oneId Zuora",
+		Run: func(cmd *cobra.Command, args []string) {
+			userName, _ := cmd.Flags().GetString("userName")
+			password, _ := cmd.Flags().GetString("password")
+
+			fmt.Printf("login to one.zuora.com for : %s\n", userName)
+
+			resp, err := login("https://one.zuora.com/api/login", userName, password)
+			if err != nil {
+				log.Fatalf("Login failed: %v", err)
+			}
+			// Check if login is successful by inspecting response status
+			if resp.StatusCode == http.StatusOK {
+				fmt.Println(resp)
+				fmt.Println("Login successful!")
+
+				var cookie = resp.Header.Get("Set-Cookie")
+
+				// After successful login, open the browser to the desired page
+				err = openBrowser("https://one.zuora.com/one-id/home", cookie)
+				if err != nil {
+					fmt.Printf("Failed to open browser: %v\n", err)
+				} else {
+					fmt.Println("Browser opened successfully!")
+				}
+			} else {
+				fmt.Printf("Login failed with status code: %d\n", resp.StatusCode)
+			}
+		},
+	}
+
+	// Define flags for the "login" command
+	loginCmd.Flags().StringP("userName", "u", "", "UserName for zuora one Id")
+	loginCmd.Flags().StringP("password", "p", "", "Password")
+
+	// Mark the greeting flag as required
+	loginCmd.MarkFlagRequired("userName")
+	loginCmd.MarkFlagRequired("password")
+
 	// Define the "delete" subcommand
 	var deleteCmd = &cobra.Command{
 		Use:   "delete",
@@ -317,6 +414,7 @@ func main() {
 	orgCmd.AddCommand(deleteCmd)
 	orgCmd.AddCommand(listCmd)
 	orgCmd.AddCommand(viewOrgCmd)
+	orgCmd.AddCommand(loginCmd)
 
 	// Add org command to the root command
 	rootCmd.AddCommand(orgCmd)
@@ -326,19 +424,4 @@ func main() {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-
-	/*
-
-		zuo data create
-		zuo data update
-		zuo data delete
-
-		zuo api + autocompletion
-
-		zuo settings read
-		zuo settings update
-		zuo settings copy
-		zuo settings compare
-
-	*/
 }
