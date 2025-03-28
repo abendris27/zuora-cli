@@ -2,12 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httputil"
 	"net/url"
 	"os"
 	"os/exec"
@@ -16,6 +18,9 @@ import (
 	"strings"
 	"time"
 
+	// "github.com/chromedp/cdproto/cdp"
+	"github.com/chromedp/cdproto/network"
+	"github.com/chromedp/chromedp"
 	"github.com/olekukonko/tablewriter"
 
 	"github.com/spf13/cobra"
@@ -237,15 +242,144 @@ func login(urlStr, username, password string) (*http.Response, error) {
 }
 
 // Function to open the URL in the default web browser
-func openBrowser(url string, cookie http.Cookie) error {
+func openBrowser(url string, cookieValue string) error {
+	var cmd *exec.Cmd
+
+	// Determine OS and open browser with cookie injection
+	switch runtime.GOOS {
+	case "windows":
+		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", url)
+	case "darwin":
+		cmd = exec.Command("open", url)
+	case "linux":
+		cmd = exec.Command("xdg-open", url)
+	default:
+		return fmt.Errorf("unsupported platform")
+	}
+
+	// Set the environment variable for the browser to use the cookie
+	cmd.Env = append(cmd.Env, fmt.Sprintf("ZUNISESSION=%s", cookieValue))
+
+	return cmd.Start()
+}
+
+// Start a local server to inject the cookie
+func startServer(url string, name string, value string, domain string, path string, httpOnly bool) {
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		// expiration := time.Now().Add(24 * time.Hour)
+		fmt.Println("Setting cookie:", name, "=", value)
+
+		// Set the session cookie in the HTTP response
+		http.SetCookie(w, &http.Cookie{
+			Name:     name,
+			Value:    value,
+			Domain:   domain, // Make sure it's the right domain
+			Path:     path,
+			HttpOnly: httpOnly,
+		})
+
+		// Redirect to the target URL
+		fmt.Println("Redirecting to:", url)
+		http.Redirect(w, r, url, http.StatusFound)
+	})
+
+	fmt.Println("Starting local server on http://localhost:8080...")
+	go func() {
+		if err := http.ListenAndServe(":8080", nil); err != nil {
+			fmt.Println("Server error:", err)
+		}
+	}()
+}
+
+// ProxyHandler intercepts requests and injects the session cookie
+func ProxyHandler(target *url.URL, name string, value string, domain string, path string, httpOnly bool) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		log.Println("🔹 Incoming Request:", r.Method, r.URL)
+		for name, values := range r.Header {
+			log.Printf("  %s: %s\n", name, values)
+		}
+		// Inject the session cookie
+		cookie := &http.Cookie{
+			Name:   name,
+			Value:  value,
+			Domain: domain,
+			Path:   path,
+			// Expires:  time.Now().Add(24 * time.Hour),
+			HttpOnly: httpOnly,
+		}
+		r.AddCookie(cookie)
+
+		// Proxy the request to Zuora
+		proxy := httputil.NewSingleHostReverseProxy(target)
+		r.Host = target.Host
+		proxy.ServeHTTP(w, r)
+	})
+}
+
+// StartProxy starts the local proxy server
+func StartProxy(name string, value string, domain string, path string, httpOnly bool) {
+	target, _ := url.Parse("https://one.zuora.com")
+	http.Handle("/", ProxyHandler(target, name, value, domain, path, httpOnly))
+
+	fmt.Println("🚀 Local proxy running at http://localhost" + ":8080" + "...")
+	log.Fatal(http.ListenAndServe(":8080", nil))
+}
+
+func SetCookie(name string, value string, domain string, path string, httpOnly bool, sameSite string) chromedp.Action {
+	return chromedp.ActionFunc(func(ctx context.Context) error {
+		err := network.SetCookie(name, value).
+			WithDomain(domain).
+			WithPath(path).
+			WithHTTPOnly(httpOnly).
+			WithSameSite(network.CookieSameSite(sameSite)).
+			Do(ctx)
+		if err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+func openBrowserWithChromeDp(url, name string, value string, domain string, path string, httpOnly bool, sameSite string) error {
+	fmt.Println("Opening browser with chromedp...", name)
+
+	ctx, cancel := chromedp.NewExecAllocator(context.Background(), chromedp.Flag("headless", false))
+	defer cancel()
+
+	ctx, cancel = chromedp.NewContext(ctx)
+	defer cancel()
+
+	// Run browser automation
+	err := chromedp.Run(ctx,
+		SetCookie(name, value, domain, path, httpOnly, sameSite),
+		chromedp.Navigate(url), // Open the page first
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			// Set the cookie using JavaScript execution
+			script := fmt.Sprintf(`document.cookie = "%s=%s";`, name, value)
+			return chromedp.Evaluate(script, nil).Do(ctx)
+
+		}),
+		chromedp.WaitVisible("body"), // Wait for body to be visible to confirm page load
+		chromedp.Reload(),            // Reload the page to apply the cookie
+	)
+
+	return err
+}
+
+func OpenBrowserWithProxy() error {
+	proxyURL := "http://localhost:8080"
+	targetURL := "https://one.zuora.com/one-id/home"
+
 	var cmd *exec.Cmd
 	switch runtime.GOOS {
 	case "windows":
-		cmd = exec.Command("cmd", "/c", "start", url)
-	case "darwin":
-		cmd = exec.Command("open", url)
+		cmd = exec.Command("cmd", "/c", "start", "chrome", "--proxy-server="+proxyURL, targetURL)
+	case "darwin": // macOS
+		cmd = exec.Command("open", "-a", "Google Chrome", "--args", "--proxy-server="+proxyURL, targetURL)
+	case "linux":
+		cmd = exec.Command("google-chrome", "--proxy-server="+proxyURL, targetURL)
 	default:
-		cmd = exec.Command("xdg-open", url)
+		return fmt.Errorf("❌ Unsupported platform")
 	}
 	return cmd.Start()
 }
@@ -339,13 +473,82 @@ func main() {
 			}
 			// Check if login is successful by inspecting response status
 			if resp.StatusCode == http.StatusOK {
-				fmt.Println(resp)
+				// fmt.Println(resp)
 				fmt.Println("Login successful!")
 
-				var cookie = resp.Header.Get("Set-Cookie")
+				var cookieStr = resp.Header.Get("Set-Cookie")
+				parts := strings.SplitN(cookieStr, ";", 2)
+				cookieParts := strings.SplitN(parts[0], "=", 2)
+				fmt.Println(cookieParts)
+
+				cookieName := cookieParts[0]
+				cookieValue := cookieParts[1]
+
+				// go StartProxy(cookieName, cookieValue, "one.zuora.com", "/", true)
+				// time.Sleep(5 * time.Second)
+				// err := OpenBrowserWithProxy()
+
+				// 	fmt.Println("Starting local server to set cookie...")
+				// 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				// 		html := fmt.Sprintf(`
+				// 		<!DOCTYPE html>
+				// 		<html>
+				// 		<head>
+				// 			<title>Zuora Login</title>
+				// 			<script>
+				// 				document.cookie = "%s=%s; path=/";
+				// 				window.location.href = "https://one.zuora.com/one-id/home";
+				// 			</script>
+				// 		</head>
+				// 		<body>
+				// 			<p>Logging in to Zuora...</p>
+				// 		</body>
+				// 		</html>
+				// 		`, cookieName, cookieValue)
+
+				// 		fmt.Println("Setting cookie:", html)
+				// 		w.Header().Set("Content-Type", "text/html")
+				// 		w.Write([]byte(html))
+				// 	})
+
+				// 	server := &http.Server{Addr: ":8085"}
+				// 	go func() {
+				// 		fmt.Println("Server started on http://localhost:8085")
+				// 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				// 			fmt.Printf("Server error: %v\n", err)
+				// 		}
+				// 	}()
+				// 	// Open the HTML file in the default browser
+				// 	var cmd *exec.Cmd
+				// 	switch runtime.GOOS {
+				// 	case "windows":
+				// 		cmd = exec.Command("rundll32", "url.dll,FileProtocolHandler", "http://localhost:8085")
+				// 	case "darwin":
+				// 		cmd = exec.Command("open", "http://localhost:8085")
+				// 	case "linux":
+				// 		cmd = exec.Command("xdg-open", "http://localhost:8085")
+				// 	default:
+				// 		fmt.Println("Unsupported platform")
+				// 		return
+				// 	}
+
+				// 	if err := cmd.Start(); err != nil {
+				// 		fmt.Printf("Failed to open browser: %v\n", err)
+				// 		return
+				// 	}
+
+				// 	fmt.Println("Browser opened successfully!")
+
+				// 	// Wait for user to press enter before shutting down server
+				// 	fmt.Println("Press Enter to exit...")
+				// 	fmt.Scanln()
+				// 	server.Shutdown(context.Background())
+				// } else {
+				// 	fmt.Printf("Login failed with status code: %d\n", resp.StatusCode)
+				// }
 
 				// After successful login, open the browser to the desired page
-				err = openBrowser("https://one.zuora.com/one-id/home", cookie)
+				err = openBrowserWithChromeDp("https://one.zuora.com/one-id/home", cookieName, cookieValue, ".one.zuora.com", "/", true, "Lax")
 				if err != nil {
 					fmt.Printf("Failed to open browser: %v\n", err)
 				} else {
